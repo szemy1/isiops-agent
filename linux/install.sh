@@ -11,11 +11,7 @@
 #   --collect <list>         Comma-separated: cpu,memory,disk,network,processes,logs,uptime (default: all)
 #   --log-paths <list>       Comma-separated log file paths/globs (default: /var/log/syslog,/var/log/auth.log)
 #   --log-level <level>      Min journal priority: debug,info,warning,error,critical (default: info)
-#   --log-max-lines <n>      Max lines per log file (default: 50)
-#
-# Environment variables (fallback):
-#   ISIOPS_URL, ISIOPS_KEY, ISIOPS_INTERVAL, ISIOPS_COLLECT,
-#   ISIOPS_LOG_PATHS, ISIOPS_LOG_LEVEL, ISIOPS_LOG_MAX_LINES
+#   --log-max-lines <n>      Max lines per batch (default: 200)
 
 set -e
 
@@ -26,7 +22,7 @@ INTERVAL="${ISIOPS_INTERVAL:-60}"
 COLLECT="${ISIOPS_COLLECT:-cpu,memory,disk,network,processes,logs,uptime}"
 LOG_PATHS="${ISIOPS_LOG_PATHS:-/var/log/syslog,/var/log/auth.log}"
 LOG_LEVEL="${ISIOPS_LOG_LEVEL:-info}"
-LOG_MAX_LINES="${ISIOPS_LOG_MAX_LINES:-50}"
+LOG_MAX_LINES="${ISIOPS_LOG_MAX_LINES:-200}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -47,16 +43,6 @@ if [ -z "$URL" ] || [ -z "$KEY" ]; then
   exit 1
 fi
 
-# Parse --collect into flags
-has() { echo ",$COLLECT," | grep -q ",$1,"; }
-DO_CPU=$(has cpu && echo 1 || echo 0)
-DO_MEM=$(has memory && echo 1 || echo 0)
-DO_DISK=$(has disk && echo 1 || echo 0)
-DO_NET=$(has network && echo 1 || echo 0)
-DO_PROC=$(has processes && echo 1 || echo 0)
-DO_LOGS=$(has logs && echo 1 || echo 0)
-DO_UPTIME=$(has uptime && echo 1 || echo 0)
-
 # Map log level to journalctl priority
 case "$LOG_LEVEL" in
   debug)    JOURNAL_PRI=7 ;;
@@ -72,13 +58,13 @@ echo "  URL:       $URL"
 echo "  Interval:  ${INTERVAL}s"
 echo "  Collect:   $COLLECT"
 echo "  Log paths: $LOG_PATHS"
-echo "  Log level: $LOG_LEVEL (journal priority $JOURNAL_PRI)"
+echo "  Log level: $LOG_LEVEL"
 echo ""
 
-# Create agent directory
-mkdir -p /opt/isiops-agent
+# Create agent directory + offset tracking dir
+mkdir -p /opt/isiops-agent/offsets
 
-# Write config file (so collect.sh reads it at runtime)
+# Write config file
 cat > /opt/isiops-agent/agent.conf << CONF_EOF
 # IsiOps Agent Configuration — generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
 ISIOPS_URL="$URL"
@@ -90,16 +76,16 @@ ISIOPS_LOG_MAX_LINES="$LOG_MAX_LINES"
 ISIOPS_JOURNAL_PRI="$JOURNAL_PRI"
 CONF_EOF
 
-# Write the collection script — reads config from agent.conf
+# Write the collection script
 cat > /opt/isiops-agent/collect.sh << 'COLLECT_EOF'
 #!/bin/bash
-# Source config
 source /opt/isiops-agent/agent.conf
 
 URL="$ISIOPS_URL"
 KEY="$ISIOPS_KEY"
 HOST=$(hostname)
 IP=$(hostname -I 2>/dev/null | awk '{ print $1 }')
+OFFSET_DIR="/opt/isiops-agent/offsets"
 
 has() { echo ",$ISIOPS_COLLECT," | grep -q ",$1,"; }
 
@@ -107,7 +93,8 @@ send() {
   curl -sS "$URL" -H "X-Intake-Key: $KEY" -H "Content-Type: application/json" -d "$1" 2>/dev/null
 }
 
-# CPU
+# ── Metrics ──────────────────────────────────────────────────────────────
+
 if has cpu; then
   CPU_COUNT=$(nproc 2>/dev/null || echo 1)
   CPU_IDLE=$(top -bn1 2>/dev/null | awk '/Cpu\(s\)/{print $8}' || echo 0)
@@ -115,7 +102,6 @@ if has cpu; then
   send "{\"sourceId\":\"$HOST\",\"category\":\"metric\",\"severity\":\"info\",\"payload\":{\"metric\":\"cpu.usage\",\"value\":$CPU_USED,\"unit\":\"percent\",\"metadata\":{\"hostname\":\"$HOST\",\"ip\":\"$IP\",\"cpu_count\":\"$CPU_COUNT\"}},\"tags\":{\"agent\":\"isiops-agent\"}}"
 fi
 
-# Memory (percentage)
 if has memory; then
   MEM_TOTAL=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
   MEM_USED=$(free -m 2>/dev/null | awk '/Mem:/{print $3}')
@@ -128,7 +114,6 @@ if has memory; then
   send "{\"sourceId\":\"$HOST\",\"category\":\"metric\",\"severity\":\"info\",\"payload\":{\"metric\":\"memory.usage\",\"value\":$MEM_PCT,\"unit\":\"percent\",\"metadata\":{\"hostname\":\"$HOST\",\"ip\":\"$IP\",\"total_mb\":\"$MEM_TOTAL\",\"used_mb\":\"$MEM_USED\",\"free_mb\":\"$MEM_FREE\"}},\"tags\":{\"agent\":\"isiops-agent\"}}"
 fi
 
-# Disk (percentage)
 if has disk; then
   DISK_PCT=$(df / 2>/dev/null | tail -1 | awk '{gsub(/%/,""); print $5}')
   DISK_TOTAL=$(df -h / 2>/dev/null | tail -1 | awk '{print $2}')
@@ -136,7 +121,6 @@ if has disk; then
   send "{\"sourceId\":\"$HOST\",\"category\":\"metric\",\"severity\":\"info\",\"payload\":{\"metric\":\"disk.usage\",\"value\":${DISK_PCT:-0},\"unit\":\"percent\",\"metadata\":{\"hostname\":\"$HOST\",\"ip\":\"$IP\",\"total\":\"$DISK_TOTAL\",\"used\":\"$DISK_USED\"}},\"tags\":{\"agent\":\"isiops-agent\"}}"
 fi
 
-# Network
 if has network; then
   NET_DATA=$(cat /proc/net/dev 2>/dev/null | tail -n+3 | grep -v lo | head -1)
   NET_IFACE=$(echo "$NET_DATA" | awk -F: '{print $1}' | xargs)
@@ -145,7 +129,6 @@ if has network; then
   send "{\"sourceId\":\"$HOST\",\"category\":\"metric\",\"severity\":\"info\",\"payload\":{\"metric\":\"network.io\",\"value\":1,\"unit\":\"bytes\",\"metadata\":{\"hostname\":\"$HOST\",\"ip\":\"$IP\",\"interface\":\"$NET_IFACE\",\"rx_bytes\":\"$NET_RX\",\"tx_bytes\":\"$NET_TX\"}},\"tags\":{\"agent\":\"isiops-agent\"}}"
 fi
 
-# Uptime
 if has uptime; then
   UPTIME_SEC=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
   OS_NAME=$(uname -s)
@@ -153,22 +136,61 @@ if has uptime; then
   send "{\"sourceId\":\"$HOST\",\"category\":\"metric\",\"severity\":\"info\",\"payload\":{\"metric\":\"system.uptime\",\"value\":$UPTIME_SEC,\"unit\":\"seconds\",\"metadata\":{\"hostname\":\"$HOST\",\"ip\":\"$IP\",\"os\":\"$OS_NAME\",\"os_version\":\"$OS_VER\"}},\"tags\":{\"agent\":\"isiops-agent\"}}"
 fi
 
-# Logs
+# ── Logs ─────────────────────────────────────────────────────────────────
+
 if has logs; then
-  # journalctl
+  # journalctl — uses --since with timestamp tracking
   if command -v journalctl &>/dev/null; then
-    LOGS=$(journalctl --since "120 seconds ago" --no-pager --priority="${ISIOPS_JOURNAL_PRI}" -o json 2>/dev/null | head -"${ISIOPS_LOG_MAX_LINES}" | jq -cs '.' 2>/dev/null || echo '[]')
+    JOURNAL_TS_FILE="$OFFSET_DIR/.journal_ts"
+    if [ -f "$JOURNAL_TS_FILE" ]; then
+      SINCE_TS=$(cat "$JOURNAL_TS_FILE")
+    else
+      SINCE_TS="120 seconds ago"
+    fi
+    LOGS=$(journalctl --since "$SINCE_TS" --no-pager --priority="${ISIOPS_JOURNAL_PRI}" -o json 2>/dev/null | head -"${ISIOPS_LOG_MAX_LINES}" | jq -cs '.' 2>/dev/null || echo '[]')
+    # Save current timestamp for next cycle
+    date -u +"%Y-%m-%d %H:%M:%S" > "$JOURNAL_TS_FILE"
     if [ "$LOGS" != "[]" ]; then
       send "{\"sourceId\":\"$HOST\",\"category\":\"log\",\"severity\":\"info\",\"payload\":{\"message\":\"journal_batch\",\"source\":\"journalctl\",\"metadata\":{\"hostname\":\"$HOST\",\"ip\":\"$IP\",\"entries\":$LOGS}},\"tags\":{\"agent\":\"isiops-agent\"}}"
     fi
   fi
 
-  # File-based logs from configured paths
+  # File-based logs — offset tracking (read only new lines since last run)
   IFS=',' read -ra PATHS <<< "$ISIOPS_LOG_PATHS"
   for LOGGLOB in "${PATHS[@]}"; do
     for LOGFILE in $LOGGLOB; do
       [ -f "$LOGFILE" ] || continue
-      LINES=$(tail -n "${ISIOPS_LOG_MAX_LINES}" "$LOGFILE" 2>/dev/null | jq -Rcs '[split("\n")[] | select(length>0)]' 2>/dev/null || echo '[]')
+      # Skip binary/compressed/rotated files
+      case "$LOGFILE" in *.gz|*.bz2|*.xz|*.zst|*.old|*.[0-9]) continue ;; esac
+      file "$LOGFILE" 2>/dev/null | grep -q text || continue
+
+      # Offset tracking: read from last known position
+      OFFSET_FILE="$OFFSET_DIR/$(echo "$LOGFILE" | tr '/' '_')"
+      CURRENT_SIZE=$(stat --format=%s "$LOGFILE" 2>/dev/null || echo 0)
+
+      if [ -f "$OFFSET_FILE" ]; then
+        LAST_OFFSET=$(cat "$OFFSET_FILE")
+      else
+        LAST_OFFSET=0
+      fi
+
+      # File was truncated/rotated (smaller than last offset)
+      if [ "$CURRENT_SIZE" -lt "$LAST_OFFSET" ]; then
+        LAST_OFFSET=0
+      fi
+
+      # No new data
+      if [ "$CURRENT_SIZE" -eq "$LAST_OFFSET" ]; then
+        continue
+      fi
+
+      # Read new bytes from last offset, take max lines
+      NEW_BYTES=$((CURRENT_SIZE - LAST_OFFSET))
+      LINES=$(dd if="$LOGFILE" bs=1 skip="$LAST_OFFSET" count="$NEW_BYTES" 2>/dev/null | head -n "${ISIOPS_LOG_MAX_LINES}" | jq -Rcs '[split("\n")[] | select(length>0)]' 2>/dev/null || echo '[]')
+
+      # Update offset
+      echo "$CURRENT_SIZE" > "$OFFSET_FILE"
+
       [ "$LINES" = "[]" ] && continue
       send "{\"sourceId\":\"$HOST\",\"category\":\"log\",\"severity\":\"info\",\"payload\":{\"message\":\"file_log_batch\",\"source\":\"$LOGFILE\",\"metadata\":{\"hostname\":\"$HOST\",\"ip\":\"$IP\",\"entries\":$LINES}},\"tags\":{\"agent\":\"isiops-agent\"}}"
     done
@@ -203,6 +225,7 @@ echo ""
 echo "=== IsiOps Agent installed ==="
 echo "  Config:   /opt/isiops-agent/agent.conf"
 echo "  Script:   /opt/isiops-agent/collect.sh"
+echo "  Offsets:  /opt/isiops-agent/offsets/"
 echo "  Service:  isiops-agent.service"
 echo "  Interval: ${INTERVAL}s"
 echo "  Collect:  $COLLECT"
